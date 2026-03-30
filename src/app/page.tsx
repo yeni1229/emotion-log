@@ -276,14 +276,7 @@ export default function HomePage() {
       }, {});
   
       // 3. 변환된 데이터를 로컬 상태에 "병합" (로컬에서 바꾼 날짜는 덮어쓰지 않음)
-      setByDay((prev) => {
-        const next = { ...prev };
-        for (const [date, keys] of Object.entries(transformed)) {
-          if (dirtyDaysRef.current.has(date)) continue;
-          next[date] = keys;
-        }
-        return next;
-      });
+      setByDay(transformed);
       console.log("📥 Supabase에서 데이터를 성공적으로 동기화했습니다.");
     } catch (error) {
       console.error("❌ 데이터 로드 실패:", error);
@@ -402,7 +395,6 @@ export default function HomePage() {
     [byDay]
   ); 
 
-
   const formattedLabel = useMemo(
     () =>
       selectedDate
@@ -469,19 +461,6 @@ export default function HomePage() {
     </div>
   );
 
-  /*const commitDay = useCallback(() => {
-    if (!selectedDate) return;
-    setByDay((prev) => {
-      const next = { ...prev };
-      if (draftKeys.length === 0) {
-        delete next[dayKey];
-        return next;
-      }
-      next[dayKey] = draftKeys;
-      return next;
-    });
-    setSelectedDate(null);
-  }, [dayKey, draftKeys, selectedDate]); */
   const commitDay = useCallback(async () => {
     if (!selectedDate) return;
     const keysToSave = byDay[dayKey] ?? [];
