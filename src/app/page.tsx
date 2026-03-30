@@ -276,7 +276,14 @@ export default function HomePage() {
       }, {});
   
       // 3. 변환된 데이터를 로컬 상태에 "병합" (로컬에서 바꾼 날짜는 덮어쓰지 않음)
-      setByDay(transformed);
+      setByDay((prev) => {
+        // 서버에서 가져온 데이터(transformed)와 현재 내 화면의 데이터(prev)를 합칩니다.
+        // 동일한 날짜가 있다면 서버 데이터가 더 정확하므로 서버 데이터를 우선합니다.
+        const merged = { ...prev, ...transformed };
+        
+        console.log("🔄 데이터 병합 완료:", merged);
+        return merged;
+      });
       console.log("📥 Supabase에서 데이터를 성공적으로 동기화했습니다.");
     } catch (error) {
       console.error("❌ 데이터 로드 실패:", error);
