@@ -1,0 +1,172 @@
+@import "tailwindcss";
+@import "react-calendar/dist/Calendar.css";
+
+/* --- 1. 기본 앱 스타일 및 리셋 (기존 코드 유지) --- */
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* --- 2. react-calendar 기본 테마 설정 (앱 디자인과 통합) --- */
+.pastel-calendar.react-calendar {
+  width: 100%;
+  max-width: 100%;
+  border: none;
+  border-radius: 1.25rem;
+  background: rgb(255 255 255 / 0.92);
+  font-family: inherit;
+  line-height: 1.25;
+  padding: 0.5rem 0.25rem 0.75rem;
+}
+
+.pastel-calendar .react-calendar__navigation {
+  margin-bottom: 0.75rem;
+}
+
+.pastel-calendar .react-calendar__navigation button {
+  border-radius: 0.75rem;
+  color: #57534e;
+}
+
+.pastel-calendar .react-calendar__navigation button:enabled:hover,
+.pastel-calendar .react-calendar__navigation button:enabled:focus {
+  background-color: rgb(254 242 242);
+}
+
+.pastel-calendar .react-calendar__month-view__weekdays {
+  font-size: 0.7rem;
+  font-weight: 600;
+  color: #a8a29e;
+  text-transform: none;
+}
+
+.pastel-calendar .react-calendar__month-view__days__day--weekend {
+  color: #e11d48;
+}
+
+/* --- 3. [핵심] 날짜 칸 높이 및 3색 점 완벽 배치 --- */
+
+/* 날짜 칸 공통 설정: 높이 확보 및 숫자 상단 정렬 */
+.pastel-calendar .react-calendar__tile {
+  border-radius: 0.75rem;
+  /* 💡 높이 조절 포인트: 아래쪽 padding을 2.8rem 정도로 줄여서 콤팩트하게 만듭니다 */
+  padding: 0.7rem 0.35rem 2.8rem 0.35rem !important; 
+  font-size: 0.85rem;
+  color: #44403c;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  position: relative; /* 점 배치를 위해 필수 */
+  box-shadow: none !important; /* 라이브러리 기본 그림자 제거 */
+}
+
+/* 숫자에 밑줄이나 불필요한 테두리 제거 */
+.pastel-calendar .react-calendar__tile abbr {
+  text-decoration: none !important;
+  border-bottom: none !important;
+}
+
+/* 컬러 점의 공통 스타일 정의 (기본값: 안 보임) */
+.pastel-calendar .react-calendar__tile::before,
+.pastel-calendar .react-calendar__tile::after {
+  content: "" !important;
+  display: none; /* 기본적으로 안 보임 */
+  position: absolute;
+  /* 💡 점 위치 포인트: 콤팩트해진 높이에 맞춰 bottom 값을 0.8rem 정도로 조절하세요 */
+  bottom: 1.2rem; 
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  pointer-events: none; /* 클릭 이벤트 방해 방지 */
+}
+
+/* --- 각 데이터별 점 배치 및 색상 --- */
+
+/* ✅ 중앙: 상태(Status) - 파랑 파스텔 점 (::before 가상 요소 사용) */
+.pastel-calendar .react-calendar__tile.has-status::before {
+  display: block;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: #bae6fd; /* sky-200 */
+}
+
+/* ✅ 왼쪽: 원인(Causes) - 핑크색 점 (::after 가상 요소 사용) */
+.pastel-calendar .react-calendar__tile.has-causes::after {
+  display: block;
+  left: calc(50% - 15px); /* 중앙에서 왼쪽으로 10px */
+  /* 💡 점이 커졌으므로 위치 보정을 위해 translateX 추가 */
+  transform: translateX(-50%); 
+  background-color: #fca5a5; /* rose-300 */
+}
+
+/* ✅ 오른쪽: 대처(Coping) - 초록 파스텔 점 (::before에 그림자로 구현) */
+/* (중앙 점에 초록색 그림자를 쏴서 오른쪽 점처럼 보이게 합니다) */
+.pastel-calendar .react-calendar__tile.has-status.has-coping::before {
+  box-shadow: 16px 0 0 0 #a7f3d0; /* emerald-200, 오른쪽으로 10px */
+}
+
+/* (예외 처리: 중앙(status)은 없고 대처(coping)만 있는 경우를 위해 coping 클래스 독자적으로 그림자 설정) */
+.pastel-calendar .react-calendar__tile.has-coping::before {
+  display: block; /* coping만 있어도 보이게 */
+  left: 50%;
+  transform: translateX(-50%);
+  /* status가 있으면 파랑, 없으면 투명하게 처리 (그림자만 보이게) */
+  background-color: transparent; 
+  box-shadow: 10px 0 0 0 #a7f3d0; /* emerald-200, 오른쪽으로 10px */
+}
+
+/* (status와 coping이 둘 다 있을 때 status색(파랑)을 투명 배경 위에 덮어씌움) */
+.pastel-calendar .react-calendar__tile.has-status.has-coping::before {
+  background-color: #bae6fd; /* sky-200 */
+}
+
+/* --- 4. 호버 및 오늘 날짜 스타일 (기존 코드 유지) --- */
+.pastel-calendar .react-calendar__tile:enabled:hover,
+.pastel-calendar .react-calendar__tile:enabled:focus {
+  background-color: rgb(243 232 255);
+}
+
+.pastel-calendar .react-calendar__tile--now {
+  background: rgb(224 231 255);
+  color: #3730a3;
+}
+
+.pastel-calendar .react-calendar__tile--now:enabled:hover,
+.pastel-calendar .react-calendar__tile--now:enabled:focus {
+  background: rgb(199 210 254);
+}
+
+/* --- 5. 선택된 날짜(Active) 스타일 정리 (기존 충돌 코드 해결) --- */
+.pastel-calendar .react-calendar__tile--active,
+.pastel-calendar .react-calendar__tile--active:enabled:hover,
+.pastel-calendar .react-calendar__tile--active:enabled:focus {
+  background: none !important;
+  background-color: transparent !important;
+  color: #44403c !important;
+}
+
+.pastel-calendar .react-calendar__tile--active abbr {
+  font-weight: 800 !important;
+  text-decoration: none !important;
+}
