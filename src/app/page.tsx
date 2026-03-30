@@ -2,7 +2,7 @@
 
 import Calendar, { type TileArgs } from "react-calendar";
 import type { Value } from "react-calendar/dist/shared/types.js";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { supabase } from "./lib/supabase";
 
 export type SymptomSubGroup = {
@@ -129,6 +129,14 @@ function tagKey(
   return `${branch}:${subId}:${tag}`;
 }
 
+function parseFullKey(fullKey: string) {
+  const parts = fullKey.split(":");
+  const branch = parts[0] ?? "";
+  const subId = parts[1] ?? "";
+  const tag = parts.slice(2).join(":");
+  return { branch, subId, tag };
+}
+
 function normalizeDate(d: Date): Date {
   // Local midnight normalization to keep day keys stable.
   return new Date(d.getFullYear(), d.getMonth(), d.getDate());
@@ -202,7 +210,7 @@ function WeekStrip({
         ))}
       </div>
 
-      <div className="mt-0.5 grid grid-cols-7 gap-4">
+      <div className="mt-0.5 grid grid-cols-7 gap-1.5">
         {days.map((d) => {
           const k = toDayKey(d);
           const isSelected = toDayKey(selectedDate) === k;
@@ -213,9 +221,9 @@ function WeekStrip({
               key={k}
               type="button"
               onClick={() => onSelect(d)}
-              className={`min-h-[46px] rounded-2xl border px-1.5 py-8 text-center transition-all duration-200 ${
+              className={`min-h-[92px] rounded-2xl border px-1.5 py-3 text-center transition-all duration-200 ${
                 isSelected
-                  ? "border-rose-300 bg-rose-100/70 shadow-sm"
+                  ? "border-rose-400 bg-rose-200/70 shadow-sm"
                   : "border-stone-200 bg-white/70 hover:bg-white"
               }`}
             >
@@ -243,7 +251,8 @@ export default function HomePage() {
   const [mounted, setMounted] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [byDay, setByDay] = useState<Record<string, string[]>>({});
-  const [draftKeys, setDraftKeys] = useState<string[]>([]);
+  const [selectedEmotion, setSelectedEmotion] = useState<string | null>(null);
+  const dirtyDaysRef = useRef<Set<string>>(new Set());
 
   const fetchRecords = useCallback(async () => {
     try {
@@ -258,6 +267,7 @@ export default function HomePage() {
       // 전공자님, 이 과정이 바로 '데이터 가공(Reduce)'의 핵심입니다!
       const transformed = data.reduce((acc: Record<string, string[]>, row) => {
         const date = row.record_date;
+        // item_id에는 "subId:tag" 형태가 들어옵니다(콜론 포함 가능)
         const fullKey = `${row.category}:${row.item_id}`;
         
         if (!acc[date]) acc[date] = [];
@@ -265,13 +275,20 @@ export default function HomePage() {
         return acc;
       }, {});
   
-      // 3. 변환된 데이터를 로컬 상태에 반영
-      setByDay(transformed);
+      // 3. 변환된 데이터를 로컬 상태에 "병합" (로컬에서 바꾼 날짜는 덮어쓰지 않음)
+      setByDay((prev) => {
+        const next = { ...prev };
+        for (const [date, keys] of Object.entries(transformed)) {
+          if (dirtyDaysRef.current.has(date)) continue;
+          next[date] = keys;
+        }
+        return next;
+      });
       console.log("📥 Supabase에서 데이터를 성공적으로 동기화했습니다.");
     } catch (error) {
       console.error("❌ 데이터 로드 실패:", error);
     }
-  }, [setByDay]);
+  }, []);
   
 
   useEffect(() => {
@@ -280,7 +297,7 @@ export default function HomePage() {
   
 
   // 1. 데이터 초기 복원 로직 (localStorage 확인 후 Supabase 동기화)
-useEffect(() => {
+  useEffect(() => {
   if (!mounted) return;
 
   const initData = async () => {
@@ -288,7 +305,7 @@ useEffect(() => {
     try {
       const raw = window.localStorage.getItem(STORAGE_KEY);
       if (raw) {
-        const parsed = JSON.parse(raw);
+        const parsed = JSON.parse(raw) as Record<string, string[]>;
         setByDay(parsed);
       }
     } catch (e) {
@@ -301,7 +318,7 @@ useEffect(() => {
   };
 
   initData();
-}, [mounted, fetchRecords]); // ✅ fetchRecords가 포함되어야 합니다.
+  }, [mounted, fetchRecords]); // ✅ fetchRecords가 포함되어야 합니다.
 
   // 기록 변경 시 localStorage에 저장(디바운스)
   useEffect(() => {
@@ -321,26 +338,37 @@ useEffect(() => {
     [selectedDate],
   );
 
-  const selectedSet = useMemo(() => new Set(draftKeys), [draftKeys]);
+  const dayKeys = useMemo(() => (dayKey ? byDay[dayKey] ?? [] : []), [byDay, dayKey]);
+  const selectedSet = useMemo(() => new Set(dayKeys), [dayKeys]);
 
   // 선택한 날짜가 바뀔 때만 초안을 해당 날짜의 저장값으로 동기화합니다.
   useEffect(() => {
     if (!selectedDate) {
-      setDraftKeys([]);
+      setSelectedEmotion(null);
       return;
     }
-    setDraftKeys(byDay[dayKey] ?? []);
+    const keys = byDay[dayKey] ?? [];
+
+    // 저장된 기록 중 '정신적' 감정(mental) 하나를 대표로 잡아 selectedEmotion에 반영
+    const mental = keys
+      .map(parseFullKey)
+      .find((p) => p.branch === "status" && p.subId === "mental" && p.tag);
+    setSelectedEmotion(mental?.tag ?? null);
   }, [byDay, dayKey, selectedDate]);
 
   const toggle = useCallback(
     (key: string) => {
       if (!selectedDate) return;
-      setDraftKeys((prev) => {
-        const next = prev.includes(key) ? prev.filter((k) => k !== key) : [...prev, key];
-        return next;
+      dirtyDaysRef.current.add(dayKey);
+      setByDay((prev) => {
+        const current = prev[dayKey] ?? [];
+        const next = current.includes(key)
+          ? current.filter((k) => k !== key)
+          : [...current, key];
+        return { ...prev, [dayKey]: next };
       });
     },
-    [selectedDate],
+    [dayKey, selectedDate],
   );
 
   const onCalendarChange = useCallback((value: Value) => {
@@ -456,17 +484,7 @@ useEffect(() => {
   }, [dayKey, draftKeys, selectedDate]); */
   const commitDay = useCallback(async () => {
     if (!selectedDate) return;
-  
-    // A. [UI 반응성] 로컬 상태를 먼저 업데이트해서 사용자에게 즉각적인 피드백을 줍니다.
-    setByDay((prev) => {
-      const next = { ...prev };
-      if (draftKeys.length === 0) {
-        delete next[dayKey];
-      } else {
-        next[dayKey] = draftKeys;
-      }
-      return next;
-    });
+    const keysToSave = byDay[dayKey] ?? [];
   
     // B. [DB 동기화] Supabase 서버에 데이터를 전송합니다.
     try {
@@ -478,11 +496,12 @@ useEffect(() => {
   
       if (deleteError) throw deleteError;
   
-      // 2. 체크된 항목(draftKeys)이 있을 때만 DB에 한 줄씩 넣습니다.
-      if (draftKeys.length > 0) {
-        const rowsToInsert = draftKeys.map(fullKey => {
+      // 2. 체크된 항목이 있을 때만 DB에 한 줄씩 넣습니다.
+      if (keysToSave.length > 0) {
+        const rowsToInsert = keysToSave.map((fullKey: string) => {
           // 'causes:stress' 형태를 분리해서 DB 컬럼에 맞게 매핑합니다.
-          const [category, item_id] = fullKey.split(':');
+          const [category, ...rest] = fullKey.split(":");
+          const item_id = rest.join(":");
           return {
             record_date: dayKey,
             category,
@@ -498,6 +517,8 @@ useEffect(() => {
       }
   
       console.log(`✅ ${dayKey} 데이터가 Supabase에 성공적으로 동기화되었습니다.`);
+      // 서버 저장까지 성공했으면, 이 날짜는 이제 덮어써도 되는 상태로 전환
+      dirtyDaysRef.current.delete(dayKey);
     } catch (error) {
       // 네트워크 오류 등으로 실패할 경우 콘솔에 찍습니다.
       console.error("❌ Supabase 저장 중 오류 발생:", error);
@@ -505,7 +526,7 @@ useEffect(() => {
   
     // 작업이 끝나면 대시보드 닫기
     setSelectedDate(null);
-  }, [dayKey, draftKeys, selectedDate, setByDay]);
+  }, [byDay, dayKey, selectedDate]);
 
   return (
     <main className="relative min-h-svh bg-gradient-to-b from-[#fdf4ff] via-[#fff7ed] to-[#f0f9ff] px-3 pb-2 pt-6 text-stone-800 sm:px-5 sm:pt-8">
