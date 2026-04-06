@@ -8,99 +8,41 @@ import { supabase } from "./lib/supabase";
 export type SymptomSubGroup = {
   id: string;
   title: string;
-  tags: readonly string[];
 };
 
-/** 카테고리별 태그 — causes: 원인 그룹, status: 상태 그룹 */
-export const groups: {
-  causes: SymptomSubGroup[];
-  status: SymptomSubGroup[];
-  coping: SymptomSubGroup[];
-} = {
-  causes: [
-    {
-      id: "environmental",
-      title: "환경적",
-      tags: [
-        "저기압/비/흐림",
-        "추위/더위",
-        "소음",
-        "강한 빛/냄새",
-      ],
-    },
-    {
-      id: "social",
-      title: "상황적",
-      tags: [
-        "사람 만남",
-        "가면 써야 함",
-        "할 일 많음",
-        "계획 이탈",
-        "예상치 못함",
-      ],
-    },
-    {
-      id: "physiological",
-      title: "생리/심리적",
-      tags: [
-        "수면 부족",
-        "식사 거름",
-        "생리",
-        "과거 회상",
-        "자기 비판",
-      ],
-    },
-  ],
-  status: [
-    {
-      id: "mental",
-      title: "정신적",
-      tags: ["슬픔", "우울", "회피", "불안/긴장", "예민", "무기력", "감정 기복", "집중 저하"],
-    },
-    {
-      id: "physical",
-      title: "신체적",
-      tags: [
-        "관절통",
-        "두통",
-        "심박수 증가",
-        "감각 예민",
-        "피로감",
-        "식욕 변화",
-        "무기력",
-      ],
-    },
-  ],
-  coping: [
-    {
-      id: "rest",
-      title: "휴식",
-      tags: [
-        "침대 눕기",
-        "암전",
-        "무소음",
-        "전자기기 멀리하기",
-        "따뜻하게 하기",
-        "아무것도 안 하기",
-        "잠",
-        "끄적끄적"
-      ],
-    },
-    {
-      id: "activity",
-      title: "활동",
-      tags: [
-        "가벼운 산책",
-        "스트레칭",
-        "샤워",
-        "언어공부",
-        "조용한 음악 듣기",
-        "맛있는 거 먹기",
-        "애니/만화 감상",
-        "노래방 가기",
-      ],
-    },
-  ],
+type BranchKey = "causes" | "status" | "coping";
+type HeaderItem = {
+  id: string;
+  branch: BranchKey;
+  subId: string;
+  title: string;
+};
+type TagItem = {
+  id: string;
+  parentId: string;
+  branch: BranchKey;
+  subId: string;
+  label: string;
+};
+
+type CustomItemRow = {
+  id: string;
+  parentId: string | null;
+  rawKey: string;
+  label: string;
+};
+
+const HEADER_MAP: Record<
+  string,
+  { branch: BranchKey; subId: string; title: string }
+> = {
+  environmental: { branch: "causes", subId: "environmental", title: "환경적" },
+  social: { branch: "causes", subId: "social", title: "상황적" },
+  physiological: { branch: "causes", subId: "physiological", title: "생리/심리적" },
+  mental: { branch: "status", subId: "mental", title: "정신적" },
+  physical: { branch: "status", subId: "physical", title: "신체적" },
+  rest: { branch: "coping", subId: "rest", title: "휴식" },
+  activity: { branch: "coping", subId: "activity", title: "활동" },
 };
 
 const STORAGE_KEY = "my-symptom-app.byDay.v1";
@@ -122,7 +64,7 @@ function pickDate(value: Value): Date | null {
 }
 
 function tagKey(
-  branch: keyof typeof groups,
+  branch: BranchKey,
   subId: string,
   tag: string,
 ): string {
@@ -135,6 +77,28 @@ function parseFullKey(fullKey: string) {
   const subId = parts[1] ?? "";
   const tag = parts.slice(2).join(":");
   return { branch, subId, tag };
+}
+
+function normalizeCustomItem(row: Record<string, unknown>): CustomItemRow | null {
+  const id = String(row.id ?? "");
+  const parentIdRaw = row.parent_id ?? row.parentId ?? null;
+  const parentId = parentIdRaw === null ? null : String(parentIdRaw);
+  const rawKey = String(row.key ?? row.code ?? row.slug ?? row.label ?? row.name ?? "").trim().toLowerCase();
+  const label = String(row.label ?? row.item_label ?? row.name ?? "").trim();
+
+  if (!id || !label) return null;
+  return { id, parentId, rawKey, label };
+}
+
+function mapHeaderFromRow(row: CustomItemRow): HeaderItem | null {
+  const mapped = HEADER_MAP[row.rawKey] ?? HEADER_MAP[row.label.toLowerCase()];
+  if (!mapped) return null;
+  return {
+    id: row.id,
+    branch: mapped.branch,
+    subId: mapped.subId,
+    title: mapped.title,
+  };
 }
 
 function normalizeDate(d: Date): Date {
@@ -252,7 +216,75 @@ export default function HomePage() {
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [byDay, setByDay] = useState<Record<string, string[]>>({});
   const [selectedEmotion, setSelectedEmotion] = useState<string | null>(null);
+  const [headersByBranch, setHeadersByBranch] = useState<Record<BranchKey, HeaderItem[]>>({
+    causes: [],
+    status: [],
+    coping: [],
+  });
+  const [tagItems, setTagItems] = useState<TagItem[]>([]);
+  const [newItemInput, setNewItemInput] = useState<Record<string, string>>({});
   const dirtyDaysRef = useRef<Set<string>>(new Set());
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressTriggeredRef = useRef(false);
+  const pressedItemRef = useRef<string | null>(null);
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  const fetchCustomItems = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("custom_items")
+      .select("*")
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      console.error("❌ custom_items 로드 실패:", error);
+      return;
+    }
+
+    const rows = (data ?? [])
+      .map((row) => normalizeCustomItem(row as Record<string, unknown>))
+      .filter((v): v is CustomItemRow => v !== null);
+
+    const parents = rows.filter((r) => r.parentId === null);
+    const parentById = new Map<string, HeaderItem>();
+    const branchHeaders: Record<BranchKey, HeaderItem[]> = {
+      causes: [],
+      status: [],
+      coping: [],
+    };
+
+    for (const p of parents) {
+      const mapped = mapHeaderFromRow(p);
+      if (!mapped) continue;
+      parentById.set(p.id, mapped);
+      branchHeaders[mapped.branch].push(mapped);
+    }
+
+    const children: TagItem[] = rows
+      .filter((r) => r.parentId !== null)
+      .flatMap((r) => {
+        if (!r.parentId) return [];
+        const parent = parentById.get(r.parentId);
+        if (!parent) return [];
+        return [
+          {
+            id: r.id,
+            parentId: r.parentId,
+            branch: parent.branch,
+            subId: parent.subId,
+            label: r.label,
+          },
+        ];
+      });
+
+    setHeadersByBranch(branchHeaders);
+    setTagItems(children);
+  }, []);
 
   const fetchRecords = useCallback(async () => {
     try {
@@ -277,12 +309,12 @@ export default function HomePage() {
   
       // 3. 변환된 데이터를 로컬 상태에 "병합" (로컬에서 바꾼 날짜는 덮어쓰지 않음)
       setByDay((prev) => {
-        // 서버에서 가져온 데이터(transformed)와 현재 내 화면의 데이터(prev)를 합칩니다.
-        // 동일한 날짜가 있다면 서버 데이터가 더 정확하므로 서버 데이터를 우선합니다.
-        const merged = { ...prev, ...transformed };
-        
-        console.log("🔄 데이터 병합 완료:", merged);
-        return merged;
+        const next = { ...prev };
+        for (const [date, keys] of Object.entries(transformed)) {
+          if (dirtyDaysRef.current.has(date)) continue;
+          next[date] = keys;
+        }
+        return next;
       });
       console.log("📥 Supabase에서 데이터를 성공적으로 동기화했습니다.");
     } catch (error) {
@@ -314,11 +346,17 @@ export default function HomePage() {
 
     // [Step 2] 그 다음, 서버(Supabase)에서 '진짜 최신' 데이터를 가져와 업데이트합니다.
     // 아까 정의한 fetchRecords 함수를 여기서 호출합니다.
-    await fetchRecords();
+    await Promise.all([fetchRecords(), fetchCustomItems()]);
   };
 
   initData();
-  }, [mounted, fetchRecords]); // ✅ fetchRecords가 포함되어야 합니다.
+  }, [mounted, fetchRecords, fetchCustomItems]); // ✅ 의존성에 fetch 함수 포함
+
+  useEffect(() => {
+    return () => {
+      clearLongPressTimer();
+    };
+  }, [clearLongPressTimer]);
 
   // 기록 변경 시 localStorage에 저장(디바운스)
   useEffect(() => {
@@ -415,7 +453,7 @@ export default function HomePage() {
     [selectedDate],
   );
 
-  const renderSubgroup = (branch: keyof typeof groups, sub: SymptomSubGroup) => (
+  const renderSubgroup = (branch: BranchKey, sub: HeaderItem) => (
     <div
       key={sub.id}
       className={
@@ -435,17 +473,75 @@ export default function HomePage() {
               : "mb-2 text-[13px] font-semibold tracking-wide text-emerald-900/80"
         }
       >
-        {sub.title}
+        <div className="flex items-center justify-between gap-2">
+          <span>{sub.title}</span>
+          <button
+            type="button"
+            onClick={() => void addCustomItem(sub)}
+            className={
+              branch === "causes"
+                ? "h-6 w-6 rounded-full bg-rose-200/80 text-rose-900"
+                : branch === "status"
+                  ? "h-6 w-6 rounded-full bg-sky-200/80 text-sky-900"
+                  : "h-6 w-6 rounded-full bg-emerald-200/80 text-emerald-900"
+            }
+            aria-label={`${sub.title} 항목 추가`}
+            title={`${sub.title} 항목 추가`}
+          >
+            +
+          </button>
+        </div>
       </h3>
       <div className="flex flex-wrap gap-1.5">
-        {sub.tags.map((tag) => {
-          const k = tagKey(branch, sub.id, tag);
+        {tagItems
+          .filter((item) => item.branch === branch && item.subId === sub.subId)
+          .map((item) => {
+          const k = tagKey(branch, sub.subId, item.label);
           const isOn = selectedSet.has(k);
           return (
             <button
-              key={k}
+              key={item.id}
               type="button"
-              onClick={() => toggle(k)}
+              onPointerDown={() => {
+                pressedItemRef.current = item.id;
+                longPressTriggeredRef.current = false;
+                clearLongPressTimer();
+                longPressTimerRef.current = window.setTimeout(async () => {
+                  longPressTriggeredRef.current = true;
+                  const ok = window.confirm(`'${item.label}' 항목을 삭제할까요?`);
+                  if (!ok) return;
+
+                  const { error } = await supabase
+                    .from("custom_items")
+                    .delete()
+                    .eq("id", item.id);
+
+                  if (error) {
+                    console.error("❌ custom_items 삭제 실패:", error);
+                    return;
+                  }
+
+                  setTagItems((prev) => prev.filter((x) => x.id !== item.id));
+                  setByDay((prev) => {
+                    const next: Record<string, string[]> = {};
+                    for (const [date, keys] of Object.entries(prev)) {
+                      next[date] = keys.filter((x) => x !== k);
+                    }
+                    return next;
+                  });
+                }, 1000);
+              }}
+              onPointerUp={clearLongPressTimer}
+              onPointerLeave={clearLongPressTimer}
+              onPointerCancel={clearLongPressTimer}
+              onClick={() => {
+                const isLongPressClick =
+                  longPressTriggeredRef.current && pressedItemRef.current === item.id;
+                longPressTriggeredRef.current = false;
+                pressedItemRef.current = null;
+                if (isLongPressClick) return;
+                toggle(k);
+              }}
               className={`rounded-full px-2 py-1 text-[11px] font-medium transition-all ${
                 isOn
                   ? branch === "causes"
@@ -460,12 +556,61 @@ export default function HomePage() {
                       : "bg-emerald-50/90 text-stone-600 ring-1 ring-emerald-100 hover:bg-emerald-100/70"
               }`}
             >
-              {tag}
+              {item.label}
             </button>
           );
         })}
       </div>
+      <div className="mt-2 flex items-center gap-2">
+        <input
+          value={newItemInput[sub.id] ?? ""}
+          onChange={(e) =>
+            setNewItemInput((prev) => ({ ...prev, [sub.id]: e.target.value }))
+          }
+          placeholder={`${sub.title} 항목 추가`}
+          className="h-7 flex-1 rounded-xl border border-stone-200/80 bg-white/90 px-2.5 text-xs outline-none placeholder:text-stone-400"
+        />
+      </div>
     </div>
+  );
+
+  const addCustomItem = useCallback(
+    async (parent: HeaderItem) => {
+      const label = (newItemInput[parent.id] ?? "").trim();
+      if (!label) return;
+
+      const payload = {
+        category: parent.branch,
+        label,
+        parent_id: parent.id,
+      };
+      const { data, error } = await supabase
+        .from("custom_items")
+        .insert(payload)
+        .select("*")
+        .single();
+
+      if (error) {
+        console.error("❌ custom_items 추가 실패:", error);
+        return;
+      }
+
+      const normalized = normalizeCustomItem(data as Record<string, unknown>);
+      if (normalized) {
+        setTagItems((prev) => [
+          ...prev,
+          {
+            id: normalized.id,
+            parentId: parent.id,
+            branch: parent.branch,
+            subId: parent.subId,
+            label: normalized.label,
+          },
+        ]);
+      }
+      setNewItemInput((prev) => ({ ...prev, [parent.id]: "" }));
+    },
+    [newItemInput],
   );
 
   const commitDay = useCallback(async () => {
@@ -645,7 +790,7 @@ export default function HomePage() {
                           </div>
                         </div>
                         <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                          {groups.causes.map((sub) =>
+                          {headersByBranch.causes.map((sub) =>
                             renderSubgroup("causes", sub),
                           )}
                         </div>
@@ -666,7 +811,7 @@ export default function HomePage() {
                           </div>
                         </div>
                         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          {groups.status.map((sub) =>
+                          {headersByBranch.status.map((sub) =>
                             renderSubgroup("status", sub),
                           )}
                         </div>
@@ -687,7 +832,7 @@ export default function HomePage() {
                           </div>
                         </div>
                         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          {groups.coping.map((sub) =>
+                          {headersByBranch.coping.map((sub) =>
                             renderSubgroup("coping", sub),
                           )}
                         </div>
