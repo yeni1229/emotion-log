@@ -573,22 +573,31 @@ export default function HomePage() {
   const isPositiveMode = moodScore >= 0;
   const moodEmoji = moodScore >= 4 ? "😄" : moodScore >= 1 ? "🙂" : moodScore >= 0 ? "😐" : moodScore >= -3 ? "😔" : "😭";
 
-  // 선택한 날짜가 바뀔 때만 초안을 해당 날짜의 저장값으로 동기화합니다.
+  // 태그/날짜에 맞춰 정신적(mental) 대표 감정만 반영 (byDay 변경 시에도 실행)
   useEffect(() => {
     if (!selectedDate) {
       setSelectedEmotion(null);
-      setMoodScore(0);
       return;
     }
     const keys = byDay[dayKey] ?? [];
-
-    // 저장된 기록 중 '정신적' 감정(mental) 하나를 대표로 잡아 selectedEmotion에 반영
     const mental = keys
       .map(parseFullKey)
       .find((p) => p.branch === "status" && p.subId === "mental" && p.tag);
     setSelectedEmotion(mental?.tag ?? null);
+  }, [byDay, dayKey, selectedDate]);
+
+  // 기분: 날짜 전환·저장소 동기화 시에만 불러오고, 같은 날에서 태그만 바꿀 때는 건드리지 않음.
+  // 편집 중(dirty)인 날은 슬라이더/미저장 값이 서버·moodByDay에 덮이지 않게 함.
+  useEffect(() => {
+    if (!selectedDate) {
+      setMoodScore(0);
+      return;
+    }
+    if (dirtyDaysRef.current.has(dayKey)) {
+      return;
+    }
     setMoodScore(moodByDay[dayKey] ?? 0);
-  }, [byDay, dayKey, moodByDay, selectedDate]);
+  }, [dayKey, moodByDay, selectedDate]);
 
   const toggle = useCallback(
     (key: string) => {
