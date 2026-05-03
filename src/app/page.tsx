@@ -10,7 +10,18 @@ export type SymptomSubGroup = {
   title: string;
 };
 
-type BranchKey = "causes" | "status" | "coping";
+type BranchKey =
+  | "causes"
+  | "status"
+  | "coping"
+  | "positive_causes"
+  | "positive_status";
+type RecordCategory =
+  | "causes"
+  | "status"
+  | "coping"
+  | "positive_causes"
+  | "positive_status";
 type HeaderItem = {
   id: string;
   branch: BranchKey;
@@ -30,6 +41,7 @@ type CustomItemRow = {
   parentId: string | null;
   rawKey: string;
   label: string;
+  category: string;
 };
 
 const HEADER_MAP: Record<
@@ -43,15 +55,112 @@ const HEADER_MAP: Record<
   physical: { branch: "status", subId: "physical", title: "신체적" },
   rest: { branch: "coping", subId: "rest", title: "휴식" },
   activity: { branch: "coping", subId: "activity", title: "활동" },
+  positive_causes: { branch: "positive_causes", subId: "positive_causes", title: "긍정 원인" },
+  positive_status: { branch: "positive_status", subId: "positive_status", title: "긍정 기분" },
 };
 
 const STORAGE_KEY = "my-symptom-app.byDay.v1";
+const STORAGE_MOOD_KEY = "my-symptom-app.moodByDay.v1";
 
 function toDayKey(d: Date): string {
   const y = d.getFullYear();
   const m = String(d.getMonth() + 1).padStart(2, "0");
   const day = String(d.getDate()).padStart(2, "0");
   return `${y}-${m}-${day}`;
+}
+
+function toNormalizedDayKey(value: unknown): string {
+  if (value instanceof Date) return toDayKey(value);
+  const raw = String(value ?? "").trim();
+  if (!raw) return "";
+
+  // Postgres DATE / 문자열: "YYYY-MM-DD" — 타임존 변환 없이 그대로(WeekStrip의 toDayKey와 동일한 달력일)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) return raw;
+
+  // timestamptz 등: 선행 YYYY-MM-DD를 달력 키로 사용(UTC·로컬 파싱으로 하루 밀림 방지)
+  const isoHead = raw.match(/^(\d{4}-\d{2}-\d{2})(?:[T\s]|$)/i);
+  if (isoHead) return isoHead[1];
+
+  const parsed = new Date(raw);
+  if (!Number.isNaN(parsed.getTime())) return toDayKey(parsed);
+
+  return raw.slice(0, 10);
+}
+
+function normalizeRecordCategory(raw: unknown): RecordCategory | null {
+  const s = String(raw ?? "")
+    .replace(/\uFEFF/g, "")
+    .trim()
+    .toLowerCase()
+    // 하이픈·일반 공백·NBSP 등 → 언더스코어 (positive-causes → positive_causes)
+    .replace(/[\s\u00A0\-]+/g, "_")
+    .replace(/_+/g, "_");
+
+  if (!s) return null;
+
+  // DB 값 positive_causes / positive_status(및 하이픈·공백 정규화 결과)를 명시적으로 허용
+  switch (s) {
+    case "causes":
+    case "status":
+    case "coping":
+    case "positive_causes":
+    case "positive_status":
+      return s;
+    default:
+      return null;
+  }
+}
+
+type UserRecordRow = {
+  record_date: unknown;
+  category: unknown;
+  item_id: unknown;
+  mood_score?: unknown;
+};
+
+/** Supabase user_records 전체를 날짜 키별 문자열 배열로 묶음(긍정 카테고리 포함, 키 중복 제거). */
+function groupRecordsByDay(rows: UserRecordRow[] | null | undefined): {
+  byDay: Record<string, string[]>;
+  moodByDay: Record<string, number>;
+} {
+  const byDay: Record<string, string[]> = {};
+  const moodByDay: Record<string, number> = {};
+  const keysByDate = new Map<string, Set<string>>();
+
+  for (const row of rows ?? []) {
+    const date = toNormalizedDayKey(row.record_date);
+    if (!date) continue;
+
+    const category = normalizeRecordCategory(row.category);
+    if (!category) continue;
+
+    const itemId = String(row.item_id ?? "").trim();
+    const fullKey = itemId.length > 0 ? `${category}:${itemId}` : category;
+
+    let set = keysByDate.get(date);
+    if (!set) {
+      set = new Set<string>();
+      keysByDate.set(date, set);
+    }
+    set.add(fullKey);
+
+    if (!(date in moodByDay)) {
+      const rawScore = row.mood_score;
+      const score =
+        typeof rawScore === "number"
+          ? rawScore
+          : typeof rawScore === "string"
+            ? Number(rawScore)
+            : 0;
+      moodByDay[date] = Number.isFinite(score) ? score : 0;
+    }
+  }
+
+  for (const [date, set] of keysByDate) {
+    byDay[date] = Array.from(set);
+  }
+
+  return { byDay, moodByDay };
 }
 
 function pickDate(value: Value): Date | null {
@@ -85,19 +194,40 @@ function normalizeCustomItem(row: Record<string, unknown>): CustomItemRow | null
   const parentId = parentIdRaw === null ? null : String(parentIdRaw);
   const rawKey = String(row.key ?? row.code ?? row.slug ?? row.label ?? row.name ?? "").trim().toLowerCase();
   const label = String(row.label ?? row.item_label ?? row.name ?? "").trim();
+  const category = String(row.category ?? "").trim().toLowerCase();
 
   if (!id || !label) return null;
-  return { id, parentId, rawKey, label };
+  return { id, parentId, rawKey, label, category };
 }
 
 function mapHeaderFromRow(row: CustomItemRow): HeaderItem | null {
-  const mapped = HEADER_MAP[row.rawKey] ?? HEADER_MAP[row.label.toLowerCase()];
-  if (!mapped) return null;
+  const mapped = HEADER_MAP[row.rawKey] ?? HEADER_MAP[row.label.toLowerCase()] ?? null;
+  if (mapped) {
+    return {
+      id: row.id,
+      branch: mapped.branch,
+      subId: mapped.subId,
+      title: mapped.title,
+    };
+  }
+
+  const categoryBranch =
+    row.category === "causes" ||
+    row.category === "status" ||
+    row.category === "coping" ||
+    row.category === "positive_causes" ||
+    row.category === "positive_status"
+      ? (row.category as BranchKey)
+      : null;
+
+  if (!categoryBranch) return null;
+
+  const subId = row.rawKey || row.label.toLowerCase().replace(/\s+/g, "_");
   return {
     id: row.id,
-    branch: mapped.branch,
-    subId: mapped.subId,
-    title: mapped.title,
+    branch: categoryBranch,
+    subId,
+    title: row.label,
   };
 }
 
@@ -118,40 +248,37 @@ function getWeekDays(anchor: Date): Date[] {
   });
 }
 
-function getDayIndicator(keys: string[] | undefined) {
-  if (!keys || keys.length === 0) {
-    return { emoji: "", accentBg: "bg-transparent", accentText: "text-transparent" };
-  }
+function getDayDotFlags(keys: string[] | undefined) {
+  const allKeysString = (keys ?? []).join("|"); // ["a:b", "c:d"] -> "a:b|c:d"
 
-  const emojiBySub: Record<string, string> = {
-    "causes:environmental": "🌦️",
-    "causes:social": "🧑‍🤝‍🧑",
-    "causes:physiological": "🧬",
-    "status:mental": "🧠",
-    "status:physical": "🫀",
-    "coping:rest": "🛌",
-    "coping:activity": "🚶",
+  return {
+    causes: allKeysString.includes("causes:"),
+    status: allKeysString.includes("status:"),
+    coping: allKeysString.includes("coping:"),
+    // 하이픈이나 언더바, 공백 이슈를 피하기 위해 includes로 체크
+    positiveCauses: allKeysString.includes("positive_causes"),
+    positiveStatus: allKeysString.includes("positive_status"),
   };
-
-  // 첫 매칭을 우선으로 하되, fallback은 점.
-  for (const k of keys) {
-    const [branch, subId] = k.split(":");
-    if (!branch || !subId) continue;
-
-    const emoji = emojiBySub[`${branch}:${subId}`] ?? "•";
-    const accent =
-      branch === "causes"
-        ? { bg: "bg-rose-100/70", text: "text-rose-900" }
-        : branch === "status"
-          ? { bg: "bg-sky-100/70", text: "text-sky-900" }
-          : { bg: "bg-emerald-100/70", text: "text-emerald-900" };
-
-    return { emoji, accentBg: accent.bg, accentText: accent.text };
-  }
-
-  return { emoji: "•", accentBg: "bg-stone-200/60", accentText: "text-stone-600" };
 }
 
+/*
+function getDayDotFlags(keys: string[] | undefined) {
+  const categories = new Set(
+    (keys ?? []).map((k) => {
+      // ":"가 있으면 분리하고, 없으면 전체를 사용 (공백 제거 포함)
+      const rawCategory = k.includes(":") ? k.split(":")[0] : k;
+      return rawCategory.trim() as RecordCategory;
+    }),
+  );
+  return {
+    causes: categories.has("causes"),
+    status: categories.has("status"),
+    coping: categories.has("coping"),
+    positiveCauses: categories.has("positive_causes"),
+    positiveStatus: categories.has("positive_status"),
+  };
+}
+*/
 function WeekStrip({
   anchorDate,
   selectedDate,
@@ -178,14 +305,19 @@ function WeekStrip({
         {days.map((d) => {
           const k = toDayKey(d);
           const isSelected = toDayKey(selectedDate) === k;
-          const indicator = getDayIndicator(byDay[k]);
-          const hasEntry = indicator.emoji !== "";
+          const dots = getDayDotFlags(byDay[k]);
+          const hasEntry =
+            dots.causes ||
+            dots.status ||
+            dots.coping ||
+            dots.positiveCauses ||
+            dots.positiveStatus;
           return (
             <button
               key={k}
               type="button"
               onClick={() => onSelect(d)}
-              className={`min-h-[92px] rounded-2xl border px-1.5 py-3 text-center transition-all duration-200 ${
+              className={`relative min-h-[98px] overflow-visible rounded-2xl border px-1.5 py-3 text-center transition-all duration-200 ${
                 isSelected
                   ? "border-rose-400 bg-rose-200/70 shadow-sm"
                   : "border-stone-200 bg-white/70 hover:bg-white"
@@ -195,13 +327,47 @@ function WeekStrip({
                 {d.getDate()}
               </div>
               {hasEntry ? (
-                <div
-                  className={`mx-auto mt-1 flex h-5 w-5 items-center justify-center rounded-full ${indicator.accentBg} ${indicator.accentText} text-[11px]`}
-                >
-                  {indicator.emoji}
+                <div className="relative z-10 mx-auto mt-2 flex w-full max-w-[42px] flex-col items-center">
+                  {/* 위쪽 3점: 원인/상태/대처 */}
+                  <div className="flex items-center justify-center gap-[4px]">
+                    {dots.causes ? (
+                      <span className="relative z-10 h-[6px] w-[6px] rounded-full bg-rose-400" />
+                    ) : (
+                      <span className="h-[6px] w-[6px] rounded-full opacity-0" />
+                    )}
+                    {dots.status ? (
+                      <span className="relative z-10 h-[6px] w-[6px] rounded-full bg-sky-400" />
+                    ) : (
+                      <span className="h-[6px] w-[6px] rounded-full opacity-0" />
+                    )}
+                    {dots.coping ? (
+                      <span className="relative z-10 h-[6px] w-[6px] rounded-full bg-emerald-400" />
+                    ) : (
+                      <span className="h-[6px] w-[6px] rounded-full opacity-0" />
+                    )}
+                  </div>
+                  {/* 아래 2점: positive 원인/상태 */}
+                  <div className="mt-[4px] flex items-center justify-center gap-[6px]">
+                    {dots.positiveCauses ? (
+                      <span
+                        className="relative z-10 h-[6px] w-[6px] rounded-full"
+                        style={{ backgroundColor: "#C084FC" }}
+                      />
+                    ) : (
+                      <span className="h-[6px] w-[6px] rounded-full opacity-0" />
+                    )}
+                    {dots.positiveStatus ? (
+                      <span
+                        className="relative z-10 h-[6px] w-[6px] rounded-full"
+                        style={{ backgroundColor: "#FDE047" }}
+                      />
+                    ) : (
+                      <span className="h-[6px] w-[6px] rounded-full opacity-0" />
+                    )}
+                  </div>
                 </div>
               ) : (
-                <div className="mx-auto mt-1 h-5 w-5" aria-hidden />
+                <div className="mx-auto mt-2 h-[15px] w-[20px]" aria-hidden />
               )}
             </button>
           );
@@ -215,11 +381,15 @@ export default function HomePage() {
   const [mounted, setMounted] = useState(false);
   const [selectedDate, setSelectedDate] = useState<Date | null>(null);
   const [byDay, setByDay] = useState<Record<string, string[]>>({});
+  const [moodByDay, setMoodByDay] = useState<Record<string, number>>({});
+  const [moodScore, setMoodScore] = useState(0);
   const [selectedEmotion, setSelectedEmotion] = useState<string | null>(null);
   const [headersByBranch, setHeadersByBranch] = useState<Record<BranchKey, HeaderItem[]>>({
     causes: [],
     status: [],
     coping: [],
+    positive_causes: [],
+    positive_status: [],
   });
   const [tagItems, setTagItems] = useState<TagItem[]>([]);
   const [newItemInput, setNewItemInput] = useState<Record<string, string>>({});
@@ -256,6 +426,8 @@ export default function HomePage() {
       causes: [],
       status: [],
       coping: [],
+      positive_causes: [],
+      positive_status: [],
     };
 
     for (const p of parents) {
@@ -291,28 +463,31 @@ export default function HomePage() {
       // 1. Supabase에서 모든 기록 가져오기
       const { data, error } = await supabase
         .from('user_records')
-        .select('record_date, category, item_id');
+        .select('record_date, category, item_id, mood_score');
   
       if (error) throw error;
-  
-      // 2. DB의 한 줄 한 줄 데이터를 { "날짜": ["category:item_id", ...] } 형태로 변환
-      // 전공자님, 이 과정이 바로 '데이터 가공(Reduce)'의 핵심입니다!
-      const transformed = data.reduce((acc: Record<string, string[]>, row) => {
-        const date = row.record_date;
-        // item_id에는 "subId:tag" 형태가 들어옵니다(콜론 포함 가능)
-        const fullKey = `${row.category}:${row.item_id}`;
-        
-        if (!acc[date]) acc[date] = [];
-        acc[date].push(fullKey);
-        return acc;
-      }, {});
-  
-      // 3. 변환된 데이터를 로컬 상태에 "병합" (로컬에서 바꾼 날짜는 덮어쓰지 않음)
+      console.log("가져온 레코드 데이터:", data);
+
+      const { byDay: groupedByDay, moodByDay: groupedMood } = groupRecordsByDay(
+        data as UserRecordRow[],
+      );
+      console.log("날짜별 그룹화된 키 목록:", Object.keys(groupedByDay));
+
+      // 변환된 데이터를 로컬 상태에 병합 (로컬에서 바꾼 날짜는 덮어쓰지 않음)
       setByDay((prev) => {
         const next = { ...prev };
-        for (const [date, keys] of Object.entries(transformed)) {
+        for (const [date, keys] of Object.entries(groupedByDay)) {
           if (dirtyDaysRef.current.has(date)) continue;
           next[date] = keys;
+        }
+        console.log("최종 구성된 byDay:", next);
+        return next;
+      });
+      setMoodByDay((prev) => {
+        const next = { ...prev };
+        for (const [date, score] of Object.entries(groupedMood)) {
+          if (dirtyDaysRef.current.has(date)) continue;
+          next[date] = score;
         }
         return next;
       });
@@ -339,6 +514,11 @@ export default function HomePage() {
       if (raw) {
         const parsed = JSON.parse(raw) as Record<string, string[]>;
         setByDay(parsed);
+      }
+      const rawMood = window.localStorage.getItem(STORAGE_MOOD_KEY);
+      if (rawMood) {
+        const parsedMood = JSON.parse(rawMood) as Record<string, number>;
+        setMoodByDay(parsedMood);
       }
     } catch (e) {
       console.error("로컬 데이터 파싱 실패", e);
@@ -371,6 +551,18 @@ export default function HomePage() {
     return () => window.clearTimeout(t);
   }, [byDay, mounted]);
 
+  useEffect(() => {
+    if (!mounted) return;
+    const t = window.setTimeout(() => {
+      try {
+        window.localStorage.setItem(STORAGE_MOOD_KEY, JSON.stringify(moodByDay));
+      } catch {
+        // 저장 실패 무시
+      }
+    }, 200);
+    return () => window.clearTimeout(t);
+  }, [moodByDay, mounted]);
+
   const dayKey = useMemo(
     () => (selectedDate ? toDayKey(selectedDate) : ""),
     [selectedDate],
@@ -378,11 +570,14 @@ export default function HomePage() {
 
   const dayKeys = useMemo(() => (dayKey ? byDay[dayKey] ?? [] : []), [byDay, dayKey]);
   const selectedSet = useMemo(() => new Set(dayKeys), [dayKeys]);
+  const isPositiveMode = moodScore >= 0;
+  const moodEmoji = moodScore >= 4 ? "😄" : moodScore >= 1 ? "🙂" : moodScore >= 0 ? "😐" : moodScore >= -3 ? "😔" : "😭";
 
   // 선택한 날짜가 바뀔 때만 초안을 해당 날짜의 저장값으로 동기화합니다.
   useEffect(() => {
     if (!selectedDate) {
       setSelectedEmotion(null);
+      setMoodScore(0);
       return;
     }
     const keys = byDay[dayKey] ?? [];
@@ -392,12 +587,17 @@ export default function HomePage() {
       .map(parseFullKey)
       .find((p) => p.branch === "status" && p.subId === "mental" && p.tag);
     setSelectedEmotion(mental?.tag ?? null);
-  }, [byDay, dayKey, selectedDate]);
+    setMoodScore(moodByDay[dayKey] ?? 0);
+  }, [byDay, dayKey, moodByDay, selectedDate]);
 
   const toggle = useCallback(
     (key: string) => {
       if (!selectedDate) return;
       dirtyDaysRef.current.add(dayKey);
+      const parsed = parseFullKey(key);
+      if (parsed.branch === "status" && parsed.subId === "mental") {
+        setSelectedEmotion((prev) => (prev === parsed.tag ? null : parsed.tag));
+      }
       setByDay((prev) => {
         const current = prev[dayKey] ?? [];
         const next = current.includes(key)
@@ -418,6 +618,15 @@ export default function HomePage() {
     setSelectedDate(normalizeDate(d));
   }, []);
 
+  const onMoodScoreChange = useCallback(
+    (value: number) => {
+      if (!selectedDate) return;
+      dirtyDaysRef.current.add(dayKey);
+      setMoodScore(value);
+    },
+    [dayKey, selectedDate],
+  );
+
   const tileClassName = useCallback(
     ({ date, view }: TileArgs) => {
       if (view !== "month") return undefined;
@@ -433,6 +642,8 @@ export default function HomePage() {
       if (types.has("causes")) classes.push("has-causes");
       if (types.has("status")) classes.push("has-status");
       if (types.has("coping")) classes.push("has-coping");
+      if (types.has("positive_causes")) classes.push("has-positive-causes");
+      if (types.has("positive_status")) classes.push("has-positive-status");
   
       // "has-causes has-status has-coping" 형태의 문자열로 반환
       return classes.join(" ");
@@ -461,7 +672,9 @@ export default function HomePage() {
           ? "rounded-2xl border border-rose-100/80 bg-white/80 p-3 shadow-sm sm:p-4"
           : branch === "status"
             ? "rounded-2xl border border-sky-100/80 bg-white/80 p-3 shadow-sm sm:p-4"
-            : "rounded-2xl border border-emerald-100/80 bg-white/80 p-3 shadow-sm sm:p-4"
+            : branch === "coping"
+              ? "rounded-2xl border border-emerald-100/80 bg-white/80 p-3 shadow-sm sm:p-4"
+              : "rounded-2xl border border-amber-100/80 bg-white/90 p-3 shadow-sm sm:p-4"
       }
     >
       <h3
@@ -470,7 +683,9 @@ export default function HomePage() {
             ? "mb-2 text-[13px] font-semibold tracking-wide text-rose-900/80"
             : branch === "status"
               ? "mb-2 text-[13px] font-semibold tracking-wide text-sky-900/80"
-              : "mb-2 text-[13px] font-semibold tracking-wide text-emerald-900/80"
+              : branch === "coping"
+                ? "mb-2 text-[13px] font-semibold tracking-wide text-emerald-900/80"
+                : "mb-2 text-[13px] font-semibold tracking-wide text-amber-900"
         }
       >
         <div className="flex items-center justify-between gap-2">
@@ -483,7 +698,9 @@ export default function HomePage() {
                 ? "h-6 w-6 rounded-full bg-rose-200/80 text-rose-900"
                 : branch === "status"
                   ? "h-6 w-6 rounded-full bg-sky-200/80 text-sky-900"
-                  : "h-6 w-6 rounded-full bg-emerald-200/80 text-emerald-900"
+                  : branch === "coping"
+                    ? "h-6 w-6 rounded-full bg-emerald-200/80 text-emerald-900"
+                    : "h-6 w-6 rounded-full bg-amber-200/90 text-amber-900"
             }
             aria-label={`${sub.title} 항목 추가`}
             title={`${sub.title} 항목 추가`}
@@ -548,12 +765,16 @@ export default function HomePage() {
                     ? "bg-rose-400 text-white shadow-md shadow-rose-200/60"
                     : branch === "status"
                       ? "bg-sky-400 text-white shadow-md shadow-sky-200/60"
-                      : "bg-emerald-400 text-white shadow-md shadow-emerald-200/60"
+                      : branch === "coping"
+                        ? "bg-emerald-400 text-white shadow-md shadow-emerald-200/60"
+                        : "bg-amber-400 text-white shadow-md shadow-amber-200/60"
                   : branch === "causes"
                     ? "bg-rose-50/90 text-stone-600 ring-1 ring-rose-100 hover:bg-rose-100/70"
                     : branch === "status"
                       ? "bg-sky-50/90 text-stone-600 ring-1 ring-sky-100 hover:bg-sky-100/70"
-                      : "bg-emerald-50/90 text-stone-600 ring-1 ring-emerald-100 hover:bg-emerald-100/70"
+                      : branch === "coping"
+                        ? "bg-emerald-50/90 text-stone-600 ring-1 ring-emerald-100 hover:bg-emerald-100/70"
+                        : "bg-amber-50/90 text-stone-600 ring-1 ring-amber-100 hover:bg-amber-100/70"
               }`}
             >
               {item.label}
@@ -616,6 +837,8 @@ export default function HomePage() {
   const commitDay = useCallback(async () => {
     if (!selectedDate) return;
     const keysToSave = byDay[dayKey] ?? [];
+    const scoreToSave = Math.max(-5, Math.min(5, moodScore));
+    setMoodByDay((prev) => ({ ...prev, [dayKey]: scoreToSave }));
   
     // B. [DB 동기화] Supabase 서버에 데이터를 전송합니다.
     try {
@@ -636,7 +859,8 @@ export default function HomePage() {
           return {
             record_date: dayKey,
             category,
-            item_id
+            item_id,
+            mood_score: scoreToSave,
           };
         });
   
@@ -650,6 +874,8 @@ export default function HomePage() {
       console.log(`✅ ${dayKey} 데이터가 Supabase에 성공적으로 동기화되었습니다.`);
       // 서버 저장까지 성공했으면, 이 날짜는 이제 덮어써도 되는 상태로 전환
       dirtyDaysRef.current.delete(dayKey);
+      // 저장 직후 즉시 재조회해서 달력 점/기록 상태를 최신 서버값으로 반영
+      await fetchRecords();
     } catch (error) {
       // 네트워크 오류 등으로 실패할 경우 콘솔에 찍습니다.
       console.error("❌ Supabase 저장 중 오류 발생:", error);
@@ -657,10 +883,16 @@ export default function HomePage() {
   
     // 작업이 끝나면 대시보드 닫기
     setSelectedDate(null);
-  }, [byDay, dayKey, selectedDate]);
+  }, [byDay, dayKey, fetchRecords, moodScore, selectedDate]);
 
   return (
-    <main className="relative min-h-svh bg-gradient-to-b from-[#fdf4ff] via-[#fff7ed] to-[#f0f9ff] px-3 pb-2 pt-6 text-stone-800 sm:px-5 sm:pt-8">
+    <main
+      className={`relative min-h-svh px-3 pb-2 pt-6 text-stone-800 sm:px-5 sm:pt-8 ${
+        isPositiveMode
+          ? "bg-gradient-to-b from-amber-50 via-sky-50 to-cyan-100"
+          : "bg-gradient-to-b from-indigo-100 via-slate-100 to-gray-200"
+      }`}
+    >
       <div className="mx-auto flex max-w-2xl flex-col gap-6 sm:gap-8 md:max-w-3xl">
         <header className="space-y-1 text-center sm:text-left">
           <p className="text-sm font-medium text-stone-500">CodedByYeni&apos;s Tracker</p>
@@ -759,6 +991,29 @@ export default function HomePage() {
                           ? "선택한 날짜에 해당하는 태그만 저장돼요."
                           : "달력에서 날짜를 눌러 기록을 시작해 보세요."}
                       </div>
+                      {selectedDate ? (
+                        <div className="mt-2 rounded-xl border border-stone-200/80 bg-white/80 p-2">
+                          <div className="mb-1 flex items-center justify-between text-[11px] font-medium text-stone-600">
+                            <span>기분 수치</span>
+                            <span>
+                              {moodEmoji} {moodScore}
+                            </span>
+                          </div>
+                          <input
+                            type="range"
+                            min={-5}
+                            max={5}
+                            step={1}
+                            value={moodScore}
+                            onChange={(e) => onMoodScoreChange(Number(e.target.value))}
+                            className="w-full accent-rose-400"
+                          />
+                          <div className="mt-0.5 flex justify-between text-[10px] text-stone-400">
+                            <span>-5 매우 나쁨</span>
+                            <span>+5 매우 좋음</span>
+                          </div>
+                        </div>
+                      ) : null}
                     </div>
 
                     <button
@@ -775,68 +1030,116 @@ export default function HomePage() {
                 <div className="flex-1 overflow-y-auto px-3 pb-2 sm:px-4">
                   {selectedDate ? (
                     <div className="space-y-4">
-                      <article className="space-y-4 rounded-3xl border border-rose-100/70 bg-gradient-to-br from-rose-50/90 to-amber-50/50 p-4 shadow-sm sm:p-5">
-                        <div className="flex items-center gap-3 border-b border-rose-100/80 pb-2">
-                          <span
-                            className="flex h-7 w-7 items-center justify-center rounded-2xl bg-rose-200/70 text-[11px] font-bold text-rose-900"
-                            aria-hidden
-                          >
-                            원
-                          </span>
-                          <div>
-                            <h2 className="text-base leading-tight font-bold text-rose-950 sm:text-lg">
-                              원인
-                            </h2>
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-                          {headersByBranch.causes.map((sub) =>
-                            renderSubgroup("causes", sub),
-                          )}
-                        </div>
-                      </article>
+                      {isPositiveMode ? (
+                        <>
+                          <article className="space-y-4 rounded-3xl border border-amber-100/70 bg-gradient-to-br from-amber-50/90 to-yellow-50/60 p-4 shadow-sm sm:p-5">
+                            <div className="flex items-center gap-3 border-b border-amber-100/80 pb-2">
+                              <span
+                                className="flex h-7 w-7 items-center justify-center rounded-2xl bg-amber-200/80 text-[12px]"
+                                aria-hidden
+                              >
+                                ✨
+                              </span>
+                              <div>
+                                <h2 className="text-base leading-tight font-bold text-amber-950 sm:text-lg">
+                                  긍정 기분
+                                </h2>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                              {headersByBranch.positive_status.map((sub) =>
+                                renderSubgroup("positive_status", sub),
+                              )}
+                            </div>
+                          </article>
 
-                      <article className="space-y-4 rounded-3xl border border-sky-100/70 bg-gradient-to-br from-sky-50/90 to-violet-50/40 p-4 shadow-sm sm:p-5">
-                        <div className="flex items-center gap-3 border-b border-sky-100/80 pb-2">
-                          <span
-                            className="flex h-7 w-7 items-center justify-center rounded-2xl bg-sky-200/70 text-[13px]"
-                            aria-hidden
-                          >
-                            ◎
-                          </span>
-                          <div>
-                            <h2 className="text-base leading-tight font-bold text-sky-950 sm:text-lg">
-                              상태
-                            </h2>
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          {headersByBranch.status.map((sub) =>
-                            renderSubgroup("status", sub),
-                          )}
-                        </div>
-                      </article>
+                          <article className="space-y-4 rounded-3xl border border-sky-100/70 bg-gradient-to-br from-sky-50/90 to-cyan-50/60 p-4 shadow-sm sm:p-5">
+                            <div className="flex items-center gap-3 border-b border-sky-100/80 pb-2">
+                              <span
+                                className="flex h-7 w-7 items-center justify-center rounded-2xl bg-sky-200/80 text-[12px]"
+                                aria-hidden
+                              >
+                                ☀️
+                              </span>
+                              <div>
+                                <h2 className="text-base leading-tight font-bold text-sky-950 sm:text-lg">
+                                  긍정 원인
+                                </h2>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                              {headersByBranch.positive_causes.map((sub) =>
+                                renderSubgroup("positive_causes", sub),
+                              )}
+                            </div>
+                          </article>
+                        </>
+                      ) : (
+                        <>
+                          <article className="space-y-4 rounded-3xl border border-rose-100/70 bg-gradient-to-br from-rose-50/90 to-amber-50/50 p-4 shadow-sm sm:p-5">
+                            <div className="flex items-center gap-3 border-b border-rose-100/80 pb-2">
+                              <span
+                                className="flex h-7 w-7 items-center justify-center rounded-2xl bg-rose-200/70 text-[11px] font-bold text-rose-900"
+                                aria-hidden
+                              >
+                                원
+                              </span>
+                              <div>
+                                <h2 className="text-base leading-tight font-bold text-rose-950 sm:text-lg">
+                                  원인
+                                </h2>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                              {headersByBranch.causes.map((sub) =>
+                                renderSubgroup("causes", sub),
+                              )}
+                            </div>
+                          </article>
 
-                      <article className="space-y-4 rounded-3xl border border-emerald-100/70 bg-gradient-to-br from-emerald-50/90 to-teal-50/40 p-4 shadow-sm sm:p-5">
-                        <div className="flex items-center gap-3 border-b border-emerald-100/80 pb-2">
-                          <span
-                            className="flex h-7 w-7 items-center justify-center rounded-2xl bg-emerald-200/70 text-[11px] font-bold text-emerald-900"
-                            aria-hidden
-                          >
-                            대
-                          </span>
-                          <div>
-                            <h2 className="text-base leading-tight font-bold text-emerald-950 sm:text-lg">
-                              대처
-                            </h2>
-                          </div>
-                        </div>
-                        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          {headersByBranch.coping.map((sub) =>
-                            renderSubgroup("coping", sub),
-                          )}
-                        </div>
-                      </article>
+                          <article className="space-y-4 rounded-3xl border border-sky-100/70 bg-gradient-to-br from-sky-50/90 to-violet-50/40 p-4 shadow-sm sm:p-5">
+                            <div className="flex items-center gap-3 border-b border-sky-100/80 pb-2">
+                              <span
+                                className="flex h-7 w-7 items-center justify-center rounded-2xl bg-sky-200/70 text-[13px]"
+                                aria-hidden
+                              >
+                                ◎
+                              </span>
+                              <div>
+                                <h2 className="text-base leading-tight font-bold text-sky-950 sm:text-lg">
+                                  상태
+                                </h2>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                              {headersByBranch.status.map((sub) =>
+                                renderSubgroup("status", sub),
+                              )}
+                            </div>
+                          </article>
+
+                          <article className="space-y-4 rounded-3xl border border-emerald-100/70 bg-gradient-to-br from-emerald-50/90 to-teal-50/40 p-4 shadow-sm sm:p-5">
+                            <div className="flex items-center gap-3 border-b border-emerald-100/80 pb-2">
+                              <span
+                                className="flex h-7 w-7 items-center justify-center rounded-2xl bg-emerald-200/70 text-[11px] font-bold text-emerald-900"
+                                aria-hidden
+                              >
+                                대
+                              </span>
+                              <div>
+                                <h2 className="text-base leading-tight font-bold text-emerald-950 sm:text-lg">
+                                  대처
+                                </h2>
+                              </div>
+                            </div>
+                            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                              {headersByBranch.coping.map((sub) =>
+                                renderSubgroup("coping", sub),
+                              )}
+                            </div>
+                          </article>
+                        </>
+                      )}
                     </div>
                   ) : null}
                 </div>
